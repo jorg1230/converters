@@ -1,6 +1,42 @@
-# Convertidor de imagenes y audio
+# Convertidor de Imagenes y Audio
 
-Aplicacion grafica en Python para seleccionar una carpeta con archivos y crear otra carpeta con las conversiones.
+![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![Tkinter](https://img.shields.io/badge/Interfaz-Tkinter-2F6F4E?style=for-the-badge)
+![Licencia](https://img.shields.io/badge/Licencia-MIT-green?style=for-the-badge)
+
+Aplicacion de escritorio para convertir archivos por lotes desde una interfaz simple. Permite elegir si vas a trabajar con imagenes o audio y despues muestra solo los formatos de salida compatibles.
+
+## Caracteristicas
+
+- Conversion por carpeta completa.
+- Opcion para incluir subcarpetas.
+- Salida en una carpeta nueva sin sobrescribir archivos existentes.
+- Barra de progreso y registro de conversiones.
+- Cancelacion durante el proceso.
+- Arquitectura abierta para agregar nuevos tipos y formatos.
+- FFmpeg incluido por dependencia de Python para conversiones de audio.
+
+## Formatos Soportados
+
+| Tipo | Entrada | Salida |
+| --- | --- | --- |
+| Imagen | `.heic`, `.heif`, `.jpg`, `.jpeg`, `.png`, `.webp`, `.tif`, `.tiff`, `.bmp` | `.png`, `.jpg` |
+| Audio | `.wav`, `.mp3` | `.wav`, `.mp3` |
+
+## Calidad
+
+| Formato | Configuracion |
+| --- | --- |
+| PNG | Sin perdida, `compress_level=0`. |
+| JPEG | Calidad maxima con `quality=100` y `subsampling=0`. JPEG siempre comprime con perdida. |
+| WAV | PCM 24-bit, sin compresion con perdida adicional. |
+| MP3 | `libmp3lame -q:a 0`, maxima calidad VBR. MP3 siempre comprime con perdida. |
+
+## Requisitos
+
+- Windows.
+- Python 3.10 o superior.
+- Conexion a internet la primera vez para instalar dependencias.
 
 ## Instalacion
 
@@ -10,24 +46,12 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## Uso
+## Uso Rapido
 
-Ejecuta la aplicacion haciendo doble clic en:
+Ejecuta la aplicacion con doble clic en:
 
 ```text
 ejecutar_convertidor.bat
-```
-
-Para crear un ejecutable `.exe`, haz doble clic en:
-
-```text
-crear_ejecutable.bat
-```
-
-El ejecutable queda en:
-
-```text
-dist\ConvertidorImagenes.exe
 ```
 
 Tambien puedes abrirla desde PowerShell:
@@ -36,39 +60,101 @@ Tambien puedes abrirla desde PowerShell:
 python .\convertir_imagenes.py
 ```
 
-En la ventana puedes:
+En la ventana:
 
-- Seleccionar la carpeta donde estan los archivos.
-- Seleccionar la carpeta donde se van a guardar las conversiones.
-- Elegir si vas a convertir imagenes o audio.
-- Elegir el formato de salida disponible para ese tipo: PNG/JPEG para imagenes, WAV/MP3 para audio.
-- Incluir subcarpetas si lo necesitas.
-- Ver el avance con la barra de progreso.
-- Cancelar la conversion antes de que termine.
+1. Selecciona la carpeta de entrada.
+2. Selecciona la carpeta de salida o deja que la app cree una automaticamente.
+3. Elige el tipo de archivo: `Imagen` o `Audio`.
+4. Elige a que formato quieres convertir.
+5. Marca `Incluir subcarpetas` si aplica.
+6. Presiona `Convertir archivos`.
 
-Por defecto se crea una carpeta junto a la original con el nombre:
+Por defecto, la carpeta de salida se crea junto a la original:
 
 ```text
-<nombre_de_la_carpeta>_convertidas_png
+<carpeta>_convertidas_<formato>
 ```
 
-## Calidad
+Ejemplo:
 
-- PNG guarda sin perdida de calidad.
-- JPEG siempre comprime con perdida, pero este script usa `quality=100` y `subsampling=0` para conservar la mayor calidad posible.
-- WAV se genera como PCM de 24 bits, sin compresion con perdida adicional.
-- MP3 siempre comprime con perdida por definicion del formato, pero se genera con `libmp3lame -q:a 0`, la configuracion VBR de mayor calidad.
+```text
+fotos_convertidas_png
+audios_convertidas_wav
+```
 
-## Agregar formatos
+## Crear Ejecutable
 
-El archivo `convertir_imagenes.py` usa una arquitectura abierta basada en `CONVERSION_FORMATS`.
-Para sumar otro formato se agrega una funcion convertidora y un registro `ConversionFormat` con:
+Para generar un `.exe`, ejecuta:
 
-- `key`: identificador interno.
-- `label`: texto visible en la interfaz.
-- `kind`: tipo de archivo al que pertenece, por ejemplo `image` o `audio`.
-- `input_extensions`: extensiones de entrada aceptadas.
-- `output_suffix`: extension del archivo convertido.
-- `converter`: funcion que recibe `source` y `destination`.
+```text
+crear_ejecutable.bat
+```
 
-Si necesitas un tipo nuevo, por ejemplo video o documentos, primero agrega una entrada en `CONVERSION_KINDS` y luego registra sus formatos en `CONVERSION_FORMATS`.
+El archivo se genera en:
+
+```text
+dist\ConvertidorImagenes.exe
+```
+
+## Arquitectura de Formatos
+
+El proyecto esta preparado para crecer sin reescribir la interfaz. Los tipos y formatos se registran en `convertir_imagenes.py`.
+
+### Tipos
+
+`CONVERSION_KINDS` define los grupos visibles en la interfaz:
+
+```python
+CONVERSION_KINDS = (
+    ConversionKind(key="image", label="Imagen", plural_label="imagenes"),
+    ConversionKind(key="audio", label="Audio", plural_label="audios"),
+)
+```
+
+### Formatos
+
+`CONVERSION_FORMATS` define cada salida disponible:
+
+```python
+ConversionFormat(
+    key="wav",
+    label="WAV sin perdida adicional",
+    kind="audio",
+    input_extensions=frozenset(SUPPORTED_AUDIO_EXTENSIONS),
+    output_suffix=".wav",
+    converter=convert_to_wav,
+)
+```
+
+Para agregar otro formato:
+
+1. Crea una funcion convertidora que reciba `source` y `destination`.
+2. Registra un nuevo `ConversionFormat`.
+3. Si es un tipo nuevo, agrega antes una entrada en `CONVERSION_KINDS`.
+
+## Dependencias
+
+| Dependencia | Uso |
+| --- | --- |
+| Pillow | Lectura y escritura de imagenes. |
+| pillow-heif | Soporte para HEIC/HEIF. |
+| imageio-ffmpeg | FFmpeg embebido para audio. |
+
+## Estructura
+
+```text
+convertidores/
+|-- convertir_imagenes.py
+|-- ejecutar_convertidor.bat
+|-- crear_ejecutable.bat
+|-- requirements.txt
+|-- ConvertidorImagenes.spec
+|-- README.md
+`-- LICENSE
+```
+
+## Licencia
+
+Este proyecto esta publicado bajo la licencia MIT. Puedes usarlo, copiarlo, modificarlo y distribuirlo libremente, incluso en proyectos personales o comerciales, siempre conservando el aviso de copyright y la licencia.
+
+Consulta el archivo [LICENSE](LICENSE) para ver el texto completo.
