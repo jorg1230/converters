@@ -41,6 +41,7 @@ echo Creando ejecutable...
     --windowed ^
     --name ConvertidorImagenes ^
     --collect-all pillow_heif ^
+    --collect-all fitz ^
     convertir_imagenes.py
 
 if errorlevel 1 (

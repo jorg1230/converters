@@ -5,11 +5,12 @@ import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import BooleanVar, StringVar, Tk, filedialog, messagebox
+from tkinter import StringVar, Tk, filedialog, messagebox
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Callable
 
+import fitz  # PyMuPDF
 from PIL import Image, ImageOps
 from imageio_ffmpeg import get_ffmpeg_exe
 from pillow_heif import register_heif_opener
@@ -30,6 +31,10 @@ SUPPORTED_IMAGE_EXTENSIONS = {
 SUPPORTED_AUDIO_EXTENSIONS = {
     ".mp3",
     ".wav",
+}
+
+SUPPORTED_PDF_EXTENSIONS = {
+    ".pdf",
 }
 
 Converter = Callable[[Path, Path], None]
@@ -62,6 +67,7 @@ class ConversionFormat:
 CONVERSION_KINDS: tuple[ConversionKind, ...] = (
     ConversionKind(key="image", label="Imagen", plural_label="imagenes"),
     ConversionKind(key="audio", label="Audio", plural_label="audios"),
+    ConversionKind(key="pdf", label="PDF", plural_label="PDFs"),
 )
 
 KIND_BY_KEY = {conversion_kind.key: conversion_kind for conversion_kind in CONVERSION_KINDS}
@@ -76,25 +82,21 @@ def unique_output_path(output_dir: Path, stem: str, suffix: str) -> Path:
     return candidate
 
 
-def default_output_dir(input_dir: Path, output_format: ConversionFormat) -> Path:
-    return input_dir.parent / f"{input_dir.name}_convertidas_{output_format.key}"
+# Sufijo de la carpeta de salida automatica segun el tipo de archivo.
+OUTPUT_DIR_SUFFIX = {
+    "image": "convertidas",
+    "audio": "convertidos",
+    "pdf": "comprimidos",
+}
 
 
-def automatic_output_dirs(input_dir: Path) -> set[Path]:
-    return {default_output_dir(input_dir, conversion_format) for conversion_format in CONVERSION_FORMATS}
+def default_output_dir(base_dir: Path, output_format: ConversionFormat) -> Path:
+    suffix = OUTPUT_DIR_SUFFIX.get(output_format.kind, "convertidos")
+    return base_dir.parent / f"{base_dir.name}_{suffix}"
 
 
-def iter_supported_files(
-    input_dir: Path,
-    recursive: bool,
-    output_format: ConversionFormat,
-) -> list[Path]:
-    pattern = "**/*" if recursive else "*"
-    return sorted(
-        path
-        for path in input_dir.glob(pattern)
-        if path.is_file() and path.suffix.lower() in output_format.input_extensions
-    )
+def automatic_output_dirs(base_dir: Path) -> set[Path]:
+    return {default_output_dir(base_dir, conversion_format) for conversion_format in CONVERSION_FORMATS}
 
 
 def convert_image(source: Path, destination: Path, output_format: str) -> None:
@@ -174,6 +176,72 @@ def convert_to_mp3(source: Path, destination: Path) -> None:
     run_ffmpeg(source, destination, ["-c:a", "libmp3lame", "-q:a", "0"])
 
 
+# Imagenes mas pequenas que esto no compensan el costo de recomprimirlas.
+PDF_MIN_IMAGE_PIXELS = 4096
+
+
+def recompress_pdf_image(document: "fitz.Document", page, xref: int, image_quality: int) -> None:
+    original = document.xref_stream_raw(xref)
+    pixmap = fitz.Pixmap(document, xref)
+    try:
+        if pixmap.alpha or pixmap.colorspace is None:
+            return
+        if pixmap.n not in (1, 3):
+            pixmap = fitz.Pixmap(fitz.csRGB, pixmap)
+        if pixmap.width * pixmap.height < PDF_MIN_IMAGE_PIXELS:
+            return
+        recompressed = pixmap.tobytes("jpeg", jpg_quality=image_quality)
+    finally:
+        pixmap = None
+
+    if original is not None and len(recompressed) >= len(original):
+        return
+    page.replace_image(xref, stream=recompressed)
+
+
+def compress_pdf(source: Path, destination: Path, image_quality: int) -> None:
+    document = fitz.open(source)
+    try:
+        processed: set[int] = set()
+        for page in document:
+            for image in page.get_images(full=True):
+                xref, smask = image[0], image[1]
+                if xref in processed:
+                    continue
+                processed.add(xref)
+                # Las imagenes con mascara de transparencia se dejan intactas
+                # para no perder el canal alfa al pasarlas a JPEG.
+                if smask:
+                    continue
+                try:
+                    recompress_pdf_image(document, page, xref, image_quality)
+                except Exception:  # noqa: BLE001 - omite imagenes que no se pueden recomprimir.
+                    continue
+
+        document.save(
+            destination,
+            garbage=4,
+            deflate=True,
+            deflate_images=True,
+            deflate_fonts=True,
+            clean=True,
+        )
+    finally:
+        document.close()
+
+
+def compress_pdf_light(source: Path, destination: Path) -> None:
+    compress_pdf(source, destination, image_quality=80)
+
+
+def compress_pdf_medium(source: Path, destination: Path) -> None:
+    compress_pdf(source, destination, image_quality=60)
+
+
+def compress_pdf_strong(source: Path, destination: Path) -> None:
+    compress_pdf(source, destination, image_quality=40)
+
+
 CONVERSION_FORMATS: tuple[ConversionFormat, ...] = (
     ConversionFormat(
         key="png",
@@ -206,6 +274,30 @@ CONVERSION_FORMATS: tuple[ConversionFormat, ...] = (
         input_extensions=frozenset(SUPPORTED_AUDIO_EXTENSIONS),
         output_suffix=".mp3",
         converter=convert_to_mp3,
+    ),
+    ConversionFormat(
+        key="pdf_light",
+        label="Comprimir poco (mejor calidad)",
+        kind="pdf",
+        input_extensions=frozenset(SUPPORTED_PDF_EXTENSIONS),
+        output_suffix=".pdf",
+        converter=compress_pdf_light,
+    ),
+    ConversionFormat(
+        key="pdf_medium",
+        label="Comprimir medio",
+        kind="pdf",
+        input_extensions=frozenset(SUPPORTED_PDF_EXTENSIONS),
+        output_suffix=".pdf",
+        converter=compress_pdf_medium,
+    ),
+    ConversionFormat(
+        key="pdf_strong",
+        label="Comprimir mucho (menor tamano)",
+        kind="pdf",
+        input_extensions=frozenset(SUPPORTED_PDF_EXTENSIONS),
+        output_suffix=".pdf",
+        converter=compress_pdf_strong,
     ),
 )
 
@@ -248,12 +340,12 @@ class ImageConverterApp:
         self.root.geometry("720x500")
         self.root.minsize(640, 440)
 
-        self.input_dir = StringVar()
+        self.input_files: list[Path] = []
+        self.input_summary = StringVar(value="Ningun archivo seleccionado")
         self.output_dir = StringVar()
         self.conversion_kind = StringVar(value="image")
         self.output_format = StringVar(value="png")
-        self.recursive = BooleanVar(value=False)
-        self.status = StringVar(value="Selecciona una carpeta para comenzar.")
+        self.status = StringVar(value="Selecciona los archivos para comenzar.")
         self.progress_text = StringVar(value="0 / 0")
 
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -280,14 +372,14 @@ class ImageConverterApp:
         )
         title.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 16))
 
-        ttk.Label(main, text="Carpeta de archivos").grid(row=1, column=0, sticky="w")
-        input_entry = ttk.Entry(main, textvariable=self.input_dir)
+        ttk.Label(main, text="Archivos").grid(row=1, column=0, sticky="w")
+        input_entry = ttk.Entry(main, textvariable=self.input_summary, state="readonly")
         input_entry.grid(row=1, column=1, sticky="ew", padx=8)
-        ttk.Button(main, text="Seleccionar", command=self.select_input_dir).grid(
+        ttk.Button(main, text="Seleccionar", command=self.select_input_files).grid(
             row=1, column=2, sticky="ew"
         )
 
-        ttk.Label(main, text="Carpeta de salida").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(main, text="Guardar en").grid(row=2, column=0, sticky="w", pady=(10, 0))
         output_entry = ttk.Entry(main, textvariable=self.output_dir)
         output_entry.grid(row=2, column=1, sticky="ew", padx=8, pady=(10, 0))
         ttk.Button(main, text="Seleccionar", command=self.select_output_dir).grid(
@@ -318,12 +410,6 @@ class ImageConverterApp:
         self.format_frame = ttk.Frame(main)
         self.format_frame.grid(row=4, column=1, sticky="w", padx=8, pady=(12, 0))
         self.rebuild_output_format_options()
-
-        ttk.Checkbutton(
-            main,
-            text="Incluir subcarpetas",
-            variable=self.recursive,
-        ).grid(row=5, column=1, sticky="w", padx=8, pady=(10, 0))
 
         self.convert_button = ttk.Button(
             main,
@@ -379,36 +465,76 @@ class ImageConverterApp:
 
     def on_conversion_kind_changed(self, *_args: object) -> None:
         self.rebuild_output_format_options()
+        # Al cambiar de tipo los archivos elegidos dejan de ser validos.
+        self.clear_input_files()
         self.update_default_output_dir()
 
     def on_output_format_changed(self, *_args: object) -> None:
         self.update_default_output_dir()
 
+    def input_base_dir(self) -> Path | None:
+        if not self.input_files:
+            return None
+        return self.input_files[0].parent
+
     def update_default_output_dir(self) -> None:
-        raw_input = self.input_dir.get().strip()
-        if not raw_input:
+        base_dir = self.input_base_dir()
+        if base_dir is None:
             return
 
-        input_dir = Path(raw_input)
-        if not self.should_update_output_dir(input_dir):
+        if not self.should_update_output_dir(base_dir):
             return
 
         output_format = get_output_format(self.output_format.get())
-        self.output_dir.set(str(default_output_dir(input_dir, output_format)))
+        self.output_dir.set(str(default_output_dir(base_dir, output_format)))
 
-    def should_update_output_dir(self, input_dir: Path) -> bool:
+    def should_update_output_dir(self, base_dir: Path) -> bool:
         raw_output = self.output_dir.get().strip()
         if not raw_output:
             return True
 
         output_dir = Path(raw_output)
-        return output_dir in automatic_output_dirs(input_dir)
+        return output_dir in automatic_output_dirs(base_dir)
 
-    def select_input_dir(self) -> None:
-        selected = filedialog.askdirectory(title="Selecciona la carpeta con archivos")
-        if selected:
-            self.input_dir.set(selected)
-            self.update_default_output_dir()
+    def current_filetypes(self) -> list[tuple[str, str]]:
+        output_format = get_output_format(self.output_format.get())
+        output_kind = get_conversion_kind(output_format.kind)
+        patterns = " ".join(f"*{extension}" for extension in sorted(output_format.input_extensions))
+        return [
+            (f"Archivos de {output_kind.label.lower()}", patterns),
+            ("Todos los archivos", "*.*"),
+        ]
+
+    def clear_input_files(self) -> None:
+        self.input_files = []
+        self.input_summary.set("Ningun archivo seleccionado")
+
+    def select_input_files(self) -> None:
+        output_format = get_output_format(self.output_format.get())
+        selected = filedialog.askopenfilenames(
+            title="Selecciona los archivos",
+            filetypes=self.current_filetypes(),
+        )
+        if not selected:
+            return
+
+        files = [
+            path
+            for path in (Path(item) for item in selected)
+            if path.suffix.lower() in output_format.input_extensions
+        ]
+        skipped = len(selected) - len(files)
+
+        self.input_files = files
+        if files:
+            summary = f"{len(files)} archivo(s) seleccionado(s)"
+            if skipped:
+                summary += f" ({skipped} omitido(s) por formato)"
+            self.input_summary.set(summary)
+        else:
+            self.input_summary.set("Ningun archivo compatible seleccionado")
+
+        self.update_default_output_dir()
 
     def select_output_dir(self) -> None:
         selected = filedialog.askdirectory(title="Selecciona donde guardar los archivos")
@@ -419,36 +545,41 @@ class ImageConverterApp:
         if self.worker and self.worker.is_alive():
             return
 
-        raw_input = self.input_dir.get().strip()
-        if not raw_input:
-            messagebox.showwarning("Falta carpeta", "Selecciona la carpeta de archivos.")
-            return
-
-        input_dir = Path(raw_input).resolve()
-        if not input_dir.is_dir():
-            messagebox.showerror("Ruta no valida", f"No existe la carpeta:\n{input_dir}")
+        if not self.input_files:
+            messagebox.showwarning("Faltan archivos", "Selecciona al menos un archivo.")
             return
 
         output_format = get_output_format(self.output_format.get())
+        files = [
+            path.resolve()
+            for path in self.input_files
+            if path.suffix.lower() in output_format.input_extensions
+        ]
+        if not files:
+            messagebox.showwarning(
+                "Sin archivos compatibles",
+                "Los archivos seleccionados no coinciden con el formato elegido.",
+            )
+            return
+
         raw_output = self.output_dir.get().strip()
-        output_dir = (
-            Path(raw_output).resolve()
-            if raw_output
-            else default_output_dir(input_dir, output_format)
-        )
+        if raw_output:
+            output_dir = Path(raw_output).resolve()
+        else:
+            output_dir = default_output_dir(files[0].parent, output_format)
 
         self.clear_log()
         self.progress["value"] = 0
         self.progress_text.set("0 / 0")
         output_kind = get_conversion_kind(output_format.kind)
-        self.status.set(f"Buscando {output_kind.plural_label}...")
+        self.status.set(f"Procesando {output_kind.plural_label}...")
         self.cancel_requested.clear()
         self.convert_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
 
         self.worker = threading.Thread(
             target=self.run_conversion,
-            args=(input_dir, output_dir, output_format, self.recursive.get()),
+            args=(files, output_dir, output_format),
             daemon=True,
         )
         self.worker.start()
@@ -462,16 +593,14 @@ class ImageConverterApp:
 
     def run_conversion(
         self,
-        input_dir: Path,
+        files: list[Path],
         output_dir: Path,
         output_format: ConversionFormat,
-        recursive: bool,
     ) -> None:
         suffix = output_format.output_suffix
-        files = iter_supported_files(input_dir, recursive, output_format)
 
         if not files:
-            self.events.put(("empty", input_dir))
+            self.events.put(("empty", None))
             return
 
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -486,10 +615,7 @@ class ImageConverterApp:
                 cancelled = True
                 break
 
-            relative_parent = source.parent.relative_to(input_dir)
-            target_dir = output_dir / relative_parent
-            target_dir.mkdir(parents=True, exist_ok=True)
-            destination = unique_output_path(target_dir, source.stem, suffix)
+            destination = unique_output_path(output_dir, source.stem, suffix)
 
             try:
                 output_format.converter(source, destination)
@@ -535,7 +661,7 @@ class ImageConverterApp:
                 self.progress_text.set(f"0 / {total}")
                 output_format = get_output_format(self.output_format.get())
                 output_kind = get_conversion_kind(output_format.kind)
-                self.status.set(f"Convirtiendo {output_kind.plural_label}...")
+                self.status.set(f"Procesando {output_kind.plural_label}...")
             elif event == "progress":
                 current, total = payload  # type: ignore[misc]
                 self.progress["value"] = current
@@ -545,10 +671,10 @@ class ImageConverterApp:
             elif event == "empty":
                 self.convert_button.configure(state="normal")
                 self.cancel_button.configure(state="disabled")
-                self.status.set("No se encontraron archivos soportados.")
+                self.status.set("No hay archivos para procesar.")
                 messagebox.showinfo(
                     "Sin archivos",
-                    f"No se encontraron archivos soportados en:\n{payload}",
+                    "No hay archivos compatibles para procesar.",
                 )
             elif event == "done":
                 summary = payload
